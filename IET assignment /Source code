@@ -1,1 +1,858 @@
 
+"""
+ITA0613 - Climate and Crop Yield Machine Learning Project
+Single-file source code.
+
+Place the assignment document in:
+    document/
+
+Place the dataset CSV in:
+    dataset/
+
+Then update DATASET_FILE below if the CSV filename is different.
+
+Core algorithms are implemented from first principles:
+    1. k-NN Regression
+    2. Locally Weighted Regression (LWR)
+    3. Candidate Elimination / Version Space
+
+No scikit-learn is used.
+"""
+
+from pathlib import Path
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATASET_DIR = PROJECT_ROOT / "dataset"
+RESULTS_DIR = PROJECT_ROOT / "results"
+PLOTS_DIR = RESULTS_DIR / "plots"
+TABLES_DIR = RESULTS_DIR / "tables"
+
+# Change this filename if your uploaded dataset has a different name.
+DATASET_FILE = DATASET_DIR / "Custom_Crops_yield_Historical_Dataset.csv"
+
+for folder in [RESULTS_DIR, PLOTS_DIR, TABLES_DIR]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# DATA PROCESSING
+# ============================================================
+
+def load_data(file_path=DATASET_FILE):
+    """Load the agro-climatic crop-yield dataset."""
+    return pd.read_csv(file_path)
+
+
+def clean_data(df):
+    """Remove duplicates and handle numeric/weather missing values."""
+    df = df.copy()
+    df = df.drop_duplicates()
+
+    numeric_cols = df.select_dtypes(include=np.number).columns
+    df[numeric_cols] = df[numeric_cols].apply(
+        pd.to_numeric, errors="coerce"
+    )
+
+    weather_cols = [
+        "Temperature_C",
+        "Humidity_%",
+        "Rainfall_mm",
+        "Wind_Speed_m_s",
+        "Solar_Radiation_MJ_m2_day",
+    ]
+
+    for col in weather_cols:
+        if col in df.columns and df[col].isnull().any():
+            df[col] = df[col].fillna(df[col].median())
+
+    return df
+
+
+def engineer_features(df):
+    """Create derived climate, nutrient and production features."""
+    df = df.copy()
+
+    if {"Temperature_C", "Rainfall_mm"}.issubset(df.columns):
+        df["Temp_Rainfall_Index"] = (
+            df["Temperature_C"] * df["Rainfall_mm"]
+        )
+
+    if {
+        "N_req_kg_per_ha",
+        "P_req_kg_per_ha",
+        "K_req_kg_per_ha",
+    }.issubset(df.columns):
+        df["NPK_Index"] = (
+            df["N_req_kg_per_ha"]
+            + df["P_req_kg_per_ha"]
+            + df["K_req_kg_per_ha"]
+        )
+
+    if {"Temperature_C", "Humidity_%"}.issubset(df.columns):
+        df["Climate_Stress_Index"] = (
+            df["Temperature_C"]
+            * (1 - df["Humidity_%"] / 100)
+        )
+
+    if {"Area_ha", "Yield_kg_per_ha"}.issubset(df.columns):
+        df["Production_Estimate_kg"] = (
+            df["Area_ha"] * df["Yield_kg_per_ha"]
+        )
+
+    return df
+
+
+def save_processed_data(df):
+    """Save cleaned and engineered data."""
+    output = DATASET_DIR / "clean_crop_yield.csv"
+    df.to_csv(output, index=False)
+    return output
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def mean_squared_error(y_true, y_pred):
+    return float(np.mean((np.asarray(y_true) - np.asarray(y_pred)) ** 2))
+
+
+def mean_absolute_error(y_true, y_pred):
+    return float(np.mean(np.abs(np.asarray(y_true) - np.asarray(y_pred))))
+
+
+# ============================================================
+# k-NN REGRESSION FROM FIRST PRINCIPLES
+# ============================================================
+
+class KNNRegressor:
+    def __init__(self, k=5, metric="euclidean"):
+        if k < 1:
+            raise ValueError("k must be at least 1")
+        self.k = k
+        self.metric = metric
+
+    def fit(self, X, y):
+        self.X_train = np.asarray(X, dtype=float)
+        self.y_train = np.asarray(y, dtype=float)
+
+        if len(self.X_train) < self.k:
+            raise ValueError("k cannot be greater than training size")
+
+        if self.metric == "mahalanobis":
+            cov = np.cov(self.X_train, rowvar=False)
+            cov = np.atleast_2d(cov)
+            cov += np.eye(cov.shape[0]) * 1e-6
+            self.inv_cov = np.linalg.pinv(cov)
+
+        return self
+
+    def _distance(self, x):
+        diff = self.X_train - x
+
+        if self.metric == "euclidean":
+            return np.sqrt(np.sum(diff ** 2, axis=1))
+
+        if self.metric == "mahalanobis":
+            return np.sqrt(
+                np.einsum(
+                    "ij,jk,ik->i",
+                    diff,
+                    self.inv_cov,
+                    diff,
+                )
+            )
+
+        raise ValueError("Unknown distance metric")
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        predictions = []
+
+        for x in X:
+            distances = self._distance(x)
+            indices = np.argsort(distances)[:self.k]
+            predictions.append(np.mean(self.y_train[indices]))
+
+        return np.asarray(predictions)
+
+
+# ============================================================
+# LOCALLY WEIGHTED REGRESSION FROM FIRST PRINCIPLES
+# ============================================================
+
+class LocallyWeightedRegression:
+    def __init__(self, tau=1.0):
+        if tau <= 0:
+            raise ValueError("tau must be greater than zero")
+        self.tau = tau
+
+    def fit(self, X, y):
+        self.X_train = np.asarray(X, dtype=float)
+        self.y_train = np.asarray(y, dtype=float)
+        return self
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        predictions = []
+
+        X_train_bias = np.c_[
+            np.ones(len(self.X_train)),
+            self.X_train,
+        ]
+
+        for x in X:
+            x_bias = np.r_[1, x]
+
+            distances = np.sum(
+                (self.X_train - x) ** 2,
+                axis=1,
+            )
+
+            weights = np.exp(
+                -distances / (2 * self.tau ** 2)
+            )
+
+            weighted_X = X_train_bias * weights[:, None]
+
+            A = X_train_bias.T @ weighted_X
+            b = X_train_bias.T @ (
+                weights * self.y_train
+            )
+
+            theta = np.linalg.pinv(A) @ b
+            predictions.append(x_bias @ theta)
+
+        return np.asarray(predictions)
+
+
+# ============================================================
+# CANDIDATE ELIMINATION / VERSION SPACE
+# ============================================================
+
+class CandidateElimination:
+    """
+    Candidate-Elimination for categorical attributes.
+
+    This algorithm is demonstrated on categorical examples.
+    Continuous climate variables should be discretized before
+    being used as hypothesis attributes.
+    """
+
+    def __init__(self, n_features, domains):
+        self.n_features = n_features
+        self.domains = domains
+        self.S = ["Ø"] * n_features
+        self.G = [["?"] * n_features]
+
+    @staticmethod
+    def covers(hypothesis, x):
+        return all(
+            h == "?" or h == value
+            for h, value in zip(hypothesis, x)
+        )
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=str)
+
+        for x, label in zip(X, y):
+            if label == "High":
+                self.update_positive(x)
+            elif label == "Low":
+                self.update_negative(x)
+
+        return self
+
+    def update_positive(self, x):
+        if self.S[0] == "Ø":
+            self.S = list(x)
+        else:
+            for i in range(self.n_features):
+                if self.S[i] != x[i]:
+                    self.S[i] = "?"
+
+        self.G = [
+            g for g in self.G
+            if self.covers(g, x)
+        ]
+
+    def update_negative(self, x):
+        new_G = []
+
+        for g in self.G:
+            if self.covers(g, x):
+                for i in range(self.n_features):
+                    if g[i] == "?":
+                        for value in self.domains[i]:
+                            if value != x[i]:
+                                if (
+                                    self.S[i] == "?"
+                                    or value == self.S[i]
+                                ):
+                                    new_g = list(g)
+                                    new_g[i] = value
+
+                                    if new_g not in new_G:
+                                        new_G.append(new_g)
+            else:
+                new_G.append(g)
+
+        self.G = new_G
+
+    def get_boundaries(self):
+        return self.S, self.G
+
+
+def create_risk_band(y):
+    """Convert continuous target values into Low/Medium/High bands."""
+    low = np.percentile(y, 33)
+    high = np.percentile(y, 67)
+
+    return np.where(
+        y <= low,
+        "Low",
+        np.where(y >= high, "High", "Medium"),
+    )
+
+
+def run_candidate_elimination_demo():
+    """
+    Controlled categorical demonstration of Candidate Elimination.
+
+    The controlled example is intentional because a simple
+    categorical hypothesis space is not directly suitable for
+    the raw continuous climate/yield values.
+    """
+    X = [
+        ["High", "Medium"],
+        ["High", "High"],
+        ["Medium", "Medium"],
+        ["Low", "Low"],
+        ["Low", "Medium"],
+    ]
+
+    y = [
+        "High",
+        "Low",
+        "Low",
+        "Low",
+        "Low",
+    ]
+
+    domains = [
+        ["Low", "Medium", "High"],
+        ["Low", "Medium", "High"],
+    ]
+
+    model = CandidateElimination(
+        n_features=2,
+        domains=domains,
+    )
+
+    model.fit(X, y)
+    return model.get_boundaries()
+
+
+# ============================================================
+# DATASET PREPARATION FOR REGRESSION
+# ============================================================
+
+def prepare_regression_data(df):
+    """
+    Select climate features and crop yield as the target.
+
+    Features are standardized manually using mean and standard
+    deviation. No scikit-learn preprocessing is used.
+    """
+    feature_candidates = [
+        "Temperature_C",
+        "Humidity_%",
+        "Rainfall_mm",
+        "Wind_Speed_m_s",
+        "Solar_Radiation_MJ_m2_day",
+    ]
+
+    available = [
+        col for col in feature_candidates
+        if col in df.columns
+    ]
+
+    if "Yield_kg_per_ha" not in df.columns:
+        raise ValueError(
+            "Yield_kg_per_ha column was not found."
+        )
+
+    if len(available) < 2:
+        raise ValueError(
+            "Not enough climate feature columns were found."
+        )
+
+    X = df[available].to_numpy(dtype=float)
+    y = df["Yield_kg_per_ha"].to_numpy(dtype=float)
+
+    means = X.mean(axis=0)
+    stds = X.std(axis=0)
+    stds[stds == 0] = 1.0
+
+    X_scaled = (X - means) / stds
+
+    return X_scaled, y, available
+
+
+def train_test_split_manual(X, y, test_ratio=0.2, seed=42):
+    """Manual randomized train/test split."""
+    rng = np.random.default_rng(seed)
+    indices = np.arange(len(X))
+    rng.shuffle(indices)
+
+    split = int(len(X) * (1 - test_ratio))
+
+    train_idx = indices[:split]
+    test_idx = indices[split:]
+
+    return (
+        X[train_idx],
+        X[test_idx],
+        y[train_idx],
+        y[test_idx],
+    )
+
+
+# ============================================================
+# EXPERIMENTS
+# ============================================================
+
+def run_knn_validation(X_train, X_test, y_train, y_test):
+    rows = []
+
+    for k in [1, 3, 5, 7, 9, 11]:
+        model = KNNRegressor(k=k, metric="euclidean")
+        model.fit(X_train, y_train)
+
+        pred = model.predict(X_test)
+
+        rows.append({
+            "k": k,
+            "MSE": mean_squared_error(y_test, pred),
+            "MAE": mean_absolute_error(y_test, pred),
+        })
+
+    result = pd.DataFrame(rows)
+    result.to_csv(
+        TABLES_DIR / "knn_validation.csv",
+        index=False,
+    )
+
+    return result
+
+
+def run_knn_metric_comparison(X_train, X_test, y_train, y_test):
+    rows = []
+
+    for metric in ["euclidean", "mahalanobis"]:
+        model = KNNRegressor(
+            k=5,
+            metric=metric,
+        )
+        model.fit(X_train, y_train)
+
+        pred = model.predict(X_test)
+
+        rows.append({
+            "Metric": metric,
+            "MSE": mean_squared_error(y_test, pred),
+            "MAE": mean_absolute_error(y_test, pred),
+        })
+
+    result = pd.DataFrame(rows)
+
+    result.to_csv(
+        TABLES_DIR / "knn_metric_comparison.csv",
+        index=False,
+    )
+
+    return result
+
+
+def run_lwr_tau_comparison(
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    sample_size=300,
+):
+    """
+    Compare LWR bandwidth values.
+
+    A sample is used because LWR solves a weighted linear system
+    separately for each query point.
+    """
+    n = min(sample_size, len(X_test))
+
+    rows = []
+
+    for tau in [0.1, 0.5, 1.0, 2.0]:
+        model = LocallyWeightedRegression(tau=tau)
+        model.fit(X_train, y_train)
+
+        pred = model.predict(X_test[:n])
+
+        rows.append({
+            "tau": tau,
+            "MSE": mean_squared_error(
+                y_test[:n],
+                pred,
+            ),
+            "MAE": mean_absolute_error(
+                y_test[:n],
+                pred,
+            ),
+        })
+
+    result = pd.DataFrame(rows)
+
+    result.to_csv(
+        TABLES_DIR / "lwr_tau_comparison.csv",
+        index=False,
+    )
+
+    return result
+
+
+def run_scalability_experiment(
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+):
+    sizes = [
+        500,
+        1000,
+        2000,
+        5000,
+        10000,
+    ]
+
+    rows = []
+
+    for size in sizes:
+        if size > len(X_train):
+            continue
+
+        model = KNNRegressor(k=5)
+        model.fit(
+            X_train[:size],
+            y_train[:size],
+        )
+
+        start = time.perf_counter()
+        pred = model.predict(
+            X_test[:50]
+        )
+        elapsed = time.perf_counter() - start
+
+        rows.append({
+            "Training_Size": size,
+            "Runtime_Seconds": elapsed,
+            "MSE": mean_squared_error(
+                y_test[:50],
+                pred,
+            ),
+        })
+
+    result = pd.DataFrame(rows)
+
+    result.to_csv(
+        TABLES_DIR / "scalability_results.csv",
+        index=False,
+    )
+
+    return result
+
+
+# ============================================================
+# VISUALIZATIONS
+# ============================================================
+
+def save_knn_actual_vs_predicted(
+    y_true,
+    y_pred,
+):
+    plt.figure(figsize=(7, 5))
+    plt.scatter(y_true, y_pred, alpha=0.5)
+
+    minimum = min(y_true.min(), y_pred.min())
+    maximum = max(y_true.max(), y_pred.max())
+
+    plt.plot(
+        [minimum, maximum],
+        [minimum, maximum],
+        linestyle="--",
+    )
+
+    plt.xlabel("Actual Yield")
+    plt.ylabel("Predicted Yield")
+    plt.title("k-NN Actual vs Predicted Yield")
+    plt.tight_layout()
+
+    plt.savefig(
+        PLOTS_DIR / "knn_actual_vs_predicted.png",
+        dpi=200,
+    )
+    plt.close()
+
+
+def save_yield_by_year(df):
+    if not {"Year", "Yield_kg_per_ha"}.issubset(df.columns):
+        return
+
+    grouped = (
+        df.groupby("Year")["Yield_kg_per_ha"]
+        .mean()
+    )
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(grouped.index, grouped.values)
+    plt.xlabel("Year")
+    plt.ylabel("Average Yield")
+    plt.title("Average Crop Yield by Year")
+    plt.tight_layout()
+
+    plt.savefig(
+        PLOTS_DIR / "yield_by_year.png",
+        dpi=200,
+    )
+    plt.close()
+
+
+def save_yield_by_crop(df):
+    if not {"Crop", "Yield_kg_per_ha"}.issubset(df.columns):
+        return
+
+    grouped = (
+        df.groupby("Crop")["Yield_kg_per_ha"]
+        .mean()
+        .sort_values(ascending=False)
+    )
+
+    plt.figure(figsize=(9, 5))
+    grouped.plot(kind="bar")
+    plt.xlabel("Crop")
+    plt.ylabel("Average Yield")
+    plt.title("Average Crop Yield by Crop")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+
+    plt.savefig(
+        PLOTS_DIR / "yield_by_crop.png",
+        dpi=200,
+    )
+    plt.close()
+
+
+def save_top_states_yield(df):
+    if not {
+        "State Name",
+        "Yield_kg_per_ha",
+    }.issubset(df.columns):
+        return
+
+    grouped = (
+        df.groupby("State Name")["Yield_kg_per_ha"]
+        .mean()
+        .sort_values(ascending=False)
+        .head(10)
+    )
+
+    plt.figure(figsize=(10, 5))
+    grouped.plot(kind="bar")
+    plt.xlabel("State")
+    plt.ylabel("Average Yield")
+    plt.title("Top 10 States by Average Crop Yield")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+
+    plt.savefig(
+        PLOTS_DIR / "top_states_yield.png",
+        dpi=200,
+    )
+    plt.close()
+
+
+def save_scalability_plot(result):
+    if result.empty:
+        return
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(
+        result["Training_Size"],
+        result["Runtime_Seconds"],
+        marker="o",
+    )
+
+    plt.xlabel("Training Size")
+    plt.ylabel("Prediction Runtime (seconds)")
+    plt.title("k-NN Scalability")
+    plt.tight_layout()
+
+    plt.savefig(
+        PLOTS_DIR / "scalability_runtime.png",
+        dpi=200,
+    )
+    plt.close()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print("=" * 60)
+    print("ITA0613 Climate and Crop Yield ML Project")
+    print("=" * 60)
+
+    if not DATASET_FILE.exists():
+        print()
+        print("Dataset not found.")
+        print("Place your dataset inside:")
+        print(DATASET_DIR)
+        print()
+        print("Expected filename:")
+        print(DATASET_FILE.name)
+        print()
+        print("If your filename is different, update DATASET_FILE")
+        print("near the top of this source_code.py file.")
+        return
+
+    # 1. Load, clean and engineer data
+    df = load_data()
+    print(f"Original records: {len(df)}")
+
+    df = clean_data(df)
+    df = engineer_features(df)
+
+    processed_path = save_processed_data(df)
+
+    print(f"Cleaned records: {len(df)}")
+    print(f"Processed data saved to: {processed_path}")
+
+    # 2. Prepare regression data
+    X, y, feature_names = prepare_regression_data(df)
+
+    print()
+    print("Regression features:")
+    for name in feature_names:
+        print(f" - {name}")
+
+    X_train, X_test, y_train, y_test = (
+        train_test_split_manual(X, y)
+    )
+
+    print()
+    print(
+        f"Training records: {len(X_train)}"
+    )
+    print(
+        f"Testing records: {len(X_test)}"
+    )
+
+    # 3. k-NN validation
+    print()
+    print("Running k-NN validation...")
+    knn_validation = run_knn_validation(
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+    )
+    print(knn_validation.to_string(index=False))
+
+    # 4. k-NN metric comparison
+    print()
+    print("Comparing distance metrics...")
+    metric_result = run_knn_metric_comparison(
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+    )
+    print(metric_result.to_string(index=False))
+
+    # 5. k-NN prediction plot
+    best_k = int(
+        knn_validation.loc[
+            knn_validation["MSE"].idxmin(),
+            "k",
+        ]
+    )
+
+    best_knn = KNNRegressor(
+        k=best_k,
+        metric="euclidean",
+    )
+    best_knn.fit(X_train, y_train)
+    knn_pred = best_knn.predict(X_test)
+
+    save_knn_actual_vs_predicted(
+        y_test,
+        knn_pred,
+    )
+
+    # 6. LWR
+    print()
+    print("Running LWR tau comparison...")
+    lwr_result = run_lwr_tau_comparison(
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+    )
+    print(lwr_result.to_string(index=False))
+
+    # 7. Candidate Elimination demo
+    print()
+    print("Running Candidate-Elimination demo...")
+    S, G = run_candidate_elimination_demo()
+
+    print("Specific Boundary (S):")
+    print(S)
+
+    print("General Boundary (G):")
+    for hypothesis in G:
+        print(hypothesis)
+
+    # 8. Scalability
+    print()
+    print("Running scalability experiment...")
+    scalability_result = run_scalability_experiment(
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+    )
+    print(scalability_result.to_string(index=False))
+
+    # 9. Additional visualizations
+    save_yield_by_year(df)
+    save_yield_by_crop(df)
+    save_top_states_yield(df)
+    save_scalability_plot(scalability_result)
+
+    print()
+    print("Completed successfully.")
+    print("Results directory:", RESULTS_DIR)
+    print("Plots directory:", PLOTS_DIR)
+    print("Tables directory:", TABLES_DIR)
+
+
+if __name__ == "__main__":
+    main()
