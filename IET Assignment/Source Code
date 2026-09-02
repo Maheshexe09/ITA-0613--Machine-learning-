@@ -1,0 +1,484 @@
+Original file is located at
+    https://colab.research.google.com/drive/1IX5FXIDnwbu375xfS4uQ9_xbdzjUOl_k
+"""
+
+from google.colab import files
+
+uploaded = files.upload()
+
+import pandas as pd
+
+file_path = "ICRISAT-District Level Data (1).csv"
+
+df = pd.read_csv(file_path)
+
+print("Dataset loaded successfully")
+print("Number of records:", df.shape[0])
+print("Number of columns:", df.shape[1])
+
+print("\nFirst 5 records:")
+print(df.head())
+
+print("Dataset Shape:", df.shape)
+
+print("\nNumber of districts:", df["Dist Code"].nunique())
+
+print("Number of states:", df["State Code"].nunique())
+
+print("Year range:", df["Year"].min(), "-", df["Year"].max())
+
+print("\nTotal missing values:")
+print(df.isnull().sum().sum())
+
+print("Column names in the dataset:\n")
+
+for i, column in enumerate(df.columns, start=1):
+    print(i, "-", column)
+
+print("Dataset Information:")
+df.info()
+
+missing_values = df.isnull().sum()
+
+print("Missing values in each column:\n")
+print(missing_values)
+
+print("\nTotal missing values in the dataset:", missing_values.sum())
+
+import numpy as np
+
+numeric_df = df.select_dtypes(include=np.number)
+
+negative_one_count = (numeric_df == -1).sum().sum()
+
+print("Total -1 values in the dataset:", negative_one_count)
+
+minus_one_columns = {}
+
+for column in numeric_df.columns:
+    count = (df[column] == -1).sum()
+    if count > 0:
+        minus_one_columns[column] = count
+
+print("Columns containing -1 values:\n")
+
+for column, count in minus_one_columns.items():
+    print(column, ":", count)
+
+df_clean = df.copy()
+
+numeric_columns = df_clean.select_dtypes(include=np.number).columns
+
+df_clean[numeric_columns] = df_clean[numeric_columns].replace(-1, np.nan)
+
+print("Data cleaning completed.")
+print("Total missing values after conversion:",
+      df_clean.isnull().sum().sum())
+
+missing_after_cleaning = df_clean.isnull().sum()
+
+print("Columns with missing values:\n")
+
+print(missing_after_cleaning[missing_after_cleaning > 0])
+
+duplicate_count = df_clean.duplicated().sum()
+
+print("Number of duplicate rows:", duplicate_count)
+
+summary = df_clean.describe().T
+
+print(summary[["count", "mean", "std", "min", "max"]])
+
+import matplotlib.pyplot as plt
+
+target = "RICE YIELD (Kg per ha)"
+
+plt.figure(figsize=(8, 5))
+
+plt.hist(
+    df_clean[target].dropna(),
+    bins=30
+)
+
+plt.xlabel("Rice Yield (Kg per ha)")
+plt.ylabel("Number of Records")
+plt.title("Distribution of Rice Yield")
+
+plt.show()
+
+
+
+
+
+yearly_rice_yield = (
+    df_clean
+    .groupby("Year")[target]
+    .mean()
+)
+
+plt.figure(figsize=(10, 5))
+
+plt.plot(
+    yearly_rice_yield.index,
+    yearly_rice_yield.values
+)
+
+plt.xlabel("Year")
+plt.ylabel("Average Rice Yield (Kg per ha)")
+plt.title("Average Rice Yield Over Time")
+
+plt.grid(True)
+plt.show()
+
+area_column = "RICE AREA (1000 ha)"
+
+plt.figure(figsize=(8, 5))
+
+plt.scatter(
+    df_clean[area_column],
+    df_clean[target],
+    alpha=0.4
+)
+
+plt.xlabel("Rice Area (1000 ha)")
+plt.ylabel("Rice Yield (Kg per ha)")
+plt.title("Rice Area vs Rice Yield")
+
+plt.show()
+
+output_path = "ICRISAT_cleaned.csv"
+
+df_clean.to_csv(output_path, index=False)
+
+print("Cleaned dataset saved successfully.")
+print("Rows:", df_clean.shape[0])
+print("Columns:", df_clean.shape[1])
+
+# Create a copy of the cleaned dataset
+df_features = df_clean.copy()
+
+# Convert rice production and area into consistent units
+# Production is in 1000 tons and area is in 1000 hectares
+# Therefore, production/area gives tons per hectare
+df_features["RICE PRODUCTION PER AREA"] = (
+    df_features["RICE PRODUCTION (1000 tons)"] /
+    df_features["RICE AREA (1000 ha)"]
+)
+
+# Replace infinite values with missing values
+df_features["RICE PRODUCTION PER AREA"] = (
+    df_features["RICE PRODUCTION PER AREA"]
+    .replace([np.inf, -np.inf], np.nan)
+)
+
+print("Derived feature created successfully.")
+print(df_features[
+    ["RICE AREA (1000 ha)",
+     "RICE PRODUCTION (1000 tons)",
+     "RICE YIELD (Kg per ha)",
+     "RICE PRODUCTION PER AREA"]
+].head())
+
+print("Statistics of the derived feature:")
+print(df_features["RICE PRODUCTION PER AREA"].describe())
+
+feature_columns = [
+    "Year",
+    "RICE AREA (1000 ha)",
+    "RICE PRODUCTION (1000 tons)",
+    "RICE PRODUCTION PER AREA"
+]
+
+target_column = "RICE YIELD (Kg per ha)"
+
+print("Selected Features:")
+print(feature_columns)
+
+print("\nTarget Variable:")
+print(target_column)
+
+model_data = df_features[
+    feature_columns + [target_column]
+].dropna()
+
+print("Original feature-engineered records:", len(df_features))
+print("Records available for modelling:", len(model_data))
+
+print("\nMissing values in modelling dataset:")
+print(model_data.isnull().sum())
+
+X = model_data[feature_columns].to_numpy()
+y = model_data[target_column].to_numpy()
+
+print("Feature matrix shape:", X.shape)
+print("Target vector shape:", y.shape)
+
+print("\nFirst 5 feature rows:")
+print(X[:5])
+
+print("\nFirst 5 target values:")
+print(y[:5])
+
+feature_output_path = "ICRISAT_feature_engineered.csv"
+
+model_data.to_csv(
+    feature_output_path,
+    index=False
+)
+
+print("Feature-engineered dataset saved successfully.")
+print("Rows:", model_data.shape[0])
+print("Columns:", model_data.shape[1])
+
+import numpy as np
+
+# Convert features and target to NumPy arrays
+X = model_data[feature_columns].to_numpy(dtype=float)
+y = model_data[target_column].to_numpy(dtype=float)
+
+# Train-test split
+np.random.seed(42)
+
+indices = np.random.permutation(len(X))
+
+split_index = int(0.8 * len(X))
+
+train_indices = indices[:split_index]
+test_indices = indices[split_index:]
+
+X_train = X[train_indices]
+X_test = X[test_indices]
+
+y_train = y[train_indices]
+y_test = y[test_indices]
+
+# Calculate training mean and standard deviation
+X_mean = X_train.mean(axis=0)
+X_std = X_train.std(axis=0)
+
+# Avoid division by zero
+X_std[X_std == 0] = 1
+
+# Standardize features
+X_train_scaled = (X_train - X_mean) / X_std
+X_test_scaled = (X_test - X_mean) / X_std
+
+print("Training samples:", len(X_train_scaled))
+print("Testing samples:", len(X_test_scaled))
+print("Number of features:", X_train_scaled.shape[1])
+
+def euclidean_distance(x1, x2):
+    return np.sqrt(np.sum((x1 - x2) ** 2))
+
+print("Euclidean distance function created successfully.")
+
+def knn_predict(X_train, y_train, X_test, k=5):
+    predictions = []
+
+    for x in X_test:
+
+        distances = []
+
+        for i in range(len(X_train)):
+            distance = euclidean_distance(x, X_train[i])
+            distances.append(distance)
+
+        distances = np.array(distances)
+
+        nearest_indices = np.argsort(distances)[:k]
+
+        nearest_values = y_train[nearest_indices]
+
+        prediction = np.mean(nearest_values)
+
+        predictions.append(prediction)
+
+    return np.array(predictions)
+
+print("k-NN regression function created successfully.")
+
+k = 5
+
+y_pred = knn_predict(
+    X_train_scaled,
+    y_train,
+    X_test_scaled,
+    k
+)
+
+print("k =", k)
+print("First 10 actual values:")
+print(y_test[:10])
+
+print("\nFirst 10 predicted values:")
+print(y_pred[:10])
+
+mae = np.mean(np.abs(y_test - y_pred))
+
+mse = np.mean((y_test - y_pred) ** 2)
+
+rmse = np.sqrt(mse)
+
+print("k-NN Regression Performance")
+print("---------------------------")
+print("MAE :", mae)
+print("MSE :", mse)
+print("RMSE:", rmse)
+
+# Calculate covariance matrix from training data
+cov_matrix = np.cov(
+    X_train_scaled,
+    rowvar=False
+)
+
+print("Covariance matrix shape:", cov_matrix.shape)
+print("\nCovariance matrix:")
+print(cov_matrix)
+
+cov_inverse = np.linalg.pinv(cov_matrix)
+
+print("Inverse covariance matrix calculated successfully.")
+print("\nInverse covariance matrix:")
+print(cov_inverse)
+
+def mahalanobis_distance(x1, x2, cov_inv):
+    difference = x1 - x2
+
+    distance = np.sqrt(
+        difference.T @ cov_inv @ difference
+    )
+
+    return distance
+
+print("Mahalanobis distance function created successfully.")
+
+def knn_predict_mahalanobis(
+    X_train,
+    y_train,
+    X_test,
+    k,
+    cov_inv
+):
+    predictions = []
+
+    for x in X_test:
+
+        distances = []
+
+        for i in range(len(X_train)):
+
+            distance = mahalanobis_distance(
+                x,
+                X_train[i],
+                cov_inv
+            )
+
+            distances.append(distance)
+
+        distances = np.array(distances)
+
+        nearest_indices = np.argsort(distances)[:k]
+
+        nearest_values = y_train[nearest_indices]
+
+        prediction = np.mean(nearest_values)
+
+        predictions.append(prediction)
+
+    return np.array(predictions)
+
+print("Mahalanobis k-NN function created successfully.")
+
+k = 5
+
+y_pred_mahalanobis = knn_predict_mahalanobis(
+    X_train_scaled,
+    y_train,
+    X_test_scaled,
+    k,
+    cov_inverse
+)
+
+print("k =", k)
+
+print("\nFirst 10 actual values:")
+print(y_test[:10])
+
+print("\nFirst 10 Mahalanobis predictions:")
+print(y_pred_mahalanobis[:10])
+
+mae_mahalanobis = np.mean(
+    np.abs(y_test - y_pred_mahalanobis)
+)
+
+mse_mahalanobis = np.mean(
+    (y_test - y_pred_mahalanobis) ** 2
+)
+
+rmse_mahalanobis = np.sqrt(
+    mse_mahalanobis
+)
+
+print("Mahalanobis k-NN Performance")
+print("----------------------------")
+print("MAE :", mae_mahalanobis)
+print("MSE :", mse_mahalanobis)
+print("RMSE:", rmse_mahalanobis)
+
+comparison = pd.DataFrame({
+    "Distance Metric": [
+        "Euclidean",
+        "Mahalanobis"
+    ],
+    "MAE": [
+        mae,
+        mae_mahalanobis
+    ],
+    "MSE": [
+        mse,
+        mse_mahalanobis
+    ],
+    "RMSE": [
+        rmse,
+        rmse_mahalanobis
+    ]
+})
+
+print(comparison)
+
+k_values = [1, 3, 5, 7, 9, 11, 15]
+
+results = []
+
+for k in k_values:
+
+    predictions = knn_predict(
+        X_train_scaled,
+        y_train,
+        X_test_scaled,
+        k
+    )
+
+    mae_k = np.mean(
+        np.abs(y_test - predictions)
+    )
+
+    mse_k = np.mean(
+        (y_test - predictions) ** 2
+    )
+
+    rmse_k = np.sqrt(mse_k)
+
+    results.append([
+        k,
+        mae_k,
+        mse_k,
+        rmse_k
+    ])
+
+k_results = pd.DataFrame(
+    results,
+    columns=["k", "MAE", "MSE", "RMSE"]
+)
+
+print(k_results)
